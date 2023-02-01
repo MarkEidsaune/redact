@@ -1,0 +1,128 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    cli_version: 0.13.9
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    python_version: 3.8.10
+    start_time: 1675275602.085615
+    t:
+      1:
+      - 1
+      - 55
+      2:
+      - 1
+      - 55
+      3:
+      - 13
+      - 16
+      - 23
+      4: 3.8.10
+      5: 0.13.9
+      8:
+      - 5
+always_save_checkpoint:
+  desc: null
+  value: false
+backend:
+  desc: null
+  value: nccl
+batch_size:
+  desc: null
+  value: 6
+beta1:
+  desc: null
+  value: 0.9
+beta2:
+  desc: null
+  value: 0.95
+bias:
+  desc: null
+  value: false
+block_size:
+  desc: null
+  value: 512
+compile:
+  desc: null
+  value: false
+data_dir:
+  desc: null
+  value: /media/nvme2/openwebtext
+dataset:
+  desc: null
+  value: openwebtext
+decay_lr:
+  desc: null
+  value: true
+device:
+  desc: null
+  value: cuda
+dropout:
+  desc: null
+  value: 0.0
+dtype:
+  desc: null
+  value: bfloat16
+eval_interval:
+  desc: null
+  value: 2000
+eval_iters:
+  desc: null
+  value: 200
+eval_only:
+  desc: null
+  value: false
+grad_clip:
+  desc: null
+  value: 1.0
+gradient_accumulation_steps:
+  desc: null
+  value: 5
+init_from:
+  desc: null
+  value: scratch
+learning_rate:
+  desc: null
+  value: 0.0006
+log_interval:
+  desc: null
+  value: 1
+lr_decay_iters:
+  desc: null
+  value: 600000
+max_iters:
+  desc: null
+  value: 600000
+min_lr:
+  desc: null
+  value: 6.0e-05
+n_embd:
+  desc: null
+  value: 768
+n_head:
+  desc: null
+  value: 12
+n_layer:
+  desc: null
+  value: 12
+out_dir:
+  desc: null
+  value: /media/nvme2/models/redact
+wandb_log:
+  desc: null
+  value: true
+wandb_project:
+  desc: null
+  value: gpt2_pretraining
+wandb_run_name:
+  desc: null
+  value: '2023-02-01 13:19:50'
+warmup_iters:
+  desc: null
+  value: 2000
+weight_decay:
+  desc: null
+  value: 0.01

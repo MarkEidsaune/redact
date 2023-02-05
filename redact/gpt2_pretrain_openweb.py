@@ -2,7 +2,7 @@
 GPT2 model pretraining on openwebtext dataset.
 References:
 Andrej Karpathy's nanoGPT repository: 
-https://github.com/karpathy/nanoGPT/blob/924a0873ebf4a3a12437633f5ab9c9fe3d421084/train.py#L135
+https://github.com/karpathy/nanoGPT/blob/master/train.py
 '''
 
 import argparse
@@ -28,21 +28,21 @@ parser = argparse.ArgumentParser(description=__doc__)
 # I/O
 parser.add_argument('--out-dir', default='/media/nvme2/models/redact', type=str, help='Output directory for saving checkpoints.')
 parser.add_argument('--eval-interval', default=2000, type=int, help='Number of iterations between evaluations.')
-parser.add_argument('--log-interval', default=1, type=int, help='Number of iterations between log entries.')
+parser.add_argument('--log-interval', default=100, type=int, help='Number of iterations between log entries.')
 parser.add_argument('--eval-iters', default=200, type=int, help='Number of iterations to perform for each evaluation.')
 parser.add_argument('--eval-only', action='store_true', help='Default = false. If true, script exits after the first evaluation.')
 parser.add_argument('--always-save-checkpoint', action='store_true', help='Default = false. If true, save checkpoint after each evaluation.  Otherwise, save only after beating best validation loss.')
 parser.add_argument('--init-from', default='scratch', type=str, help='Model initialization method.  Either \'scratch\', \'resume\', or \'gpt2...\'.')
 # Logging
 parser.add_argument( '--wandb-log', action='store_true', help='Default = false.  If true, log results using wandb account.')
-parser.add_argument('--wandb-project', default='gpt2_pretraining', type=str, help='Wandb project name.')
+parser.add_argument('--wandb-project', default='gpt2_pretraining_owt', type=str, help='Wandb project name.')
 parser.add_argument('--wandb-run-name', default=dttm, type=str, help='Wandb run name.')
 # Data
 parser.add_argument('--dataset', default='openwebtext', type=str, help='Name of training dataset.')
 parser.add_argument('--data-dir', default='/media/nvme2/openwebtext', type=str, help='Data directory for training dataset.')
-parser.add_argument('--gradient-accumulation-steps', default=5, type=int, help='Used to simulate larger batch sizes.')
-parser.add_argument('--batch-size', default=6, type=int, help='Batch size.  If gradient-accumulation-steps > 1, this is the micro-batch size.')
-parser.add_argument('--block-size', default=512, type=int, help='Number of input tokens.')
+parser.add_argument('--gradient-accumulation-steps', default=4, type=int, help='Used to simulate larger batch sizes.')
+parser.add_argument('--batch-size', default=3, type=int, help='Batch size.  If gradient-accumulation-steps > 1, this is the micro-batch size.')
+parser.add_argument('--block-size', default=1024, type=int, help='Number of input tokens.')
 # Model
 parser.add_argument('--n-layer', default=12, type=int, help='Number of transformer blocks in model.')
 parser.add_argument('--n-head', default=12, type=int, help='Number of attention heads in each transformer block.')
@@ -51,7 +51,7 @@ parser.add_argument('--dropout', default=0.0, type=float, help='For pretraining,
 parser.add_argument('--bias', action='store_true', help='Default = false.  If true, use bias in LayerNorm and Linear layers.')
 # Optimizer
 parser.add_argument('--learning-rate', default=6e-4, type=float, help='Maximum learning rate.')
-parser.add_argument('--max-iters', default=600000, type=int, help='Total number of training iterations.')
+parser.add_argument('--max-iters', default=200000, type=int, help='Total number of training iterations.')
 parser.add_argument('--weight-decay', default=1e-2, type=float)
 parser.add_argument('--beta1', default=0.9, type=float)
 parser.add_argument('--beta2', default=0.95, type=float)
@@ -59,16 +59,17 @@ parser.add_argument('--grad-clip', default=1.0, type=float, help='Clip gradients
 # Learning rate decay
 parser.add_argument('--decay-lr', action='store_false', help='Default = true. If false, do not decay learning rate.')
 parser.add_argument('--warmup-iters', default=2000, type=int)
-parser.add_argument('--lr-decay-iters', default=600000, type=int, help='Should be ~ max-iters.')
+parser.add_argument('--lr-decay-iters', default=200000, type=int, help='Should be ~ max-iters.')
 parser.add_argument('--min-lr', default=6e-5, type=float, help='Should be ~ learning_rate/10.')
 # DDP settings
 parser.add_argument('--backend', default='nccl', type=str, help='\'nccl\', \'gloo\', etc.')
 parser.add_argument('--device', default='cuda', type=str, help='\'cpu\', \'cuda\', \'cuda:0\', \'cuda:1\', etc.')
-parser.add_argument('--dtype', default='bfloat16', type=str, help='\'float32\', \'bfloat16\', or \'float16\'. The latter will auto-implement a GradScaler.')
+parser.add_argument('--dtype', default='float16', type=str, help='\'float32\', \'bfloat16\', or \'float16\'. The latter will auto-implement a GradScaler.')
 parser.add_argument('--compile', action='store_false', help='Default = true.  If false, do not use PyTorch 2.0 to compile the model to be faster.')
 
 args = parser.parse_args()
 config = vars(args)
+print(config)
 
 # Set up distributed training
 ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
@@ -88,45 +89,52 @@ else:
 if master_process:
     os.makedirs(args.out_dir, exist_ok=True)
 
-torch.manual_seed(421 + seed_offset)
+torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # Allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # Allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # For later us in torch.autocast
 # Note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type)
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# Pytorch data loaders
-owt_train_ds = OWTDataset(
-    dir=args.data_dir, split='train', block_size=args.block_size
-)
-owt_val_ds = OWTDataset(
-    dir=args.data_dir, split='val', block_size=args.block_size
-)
-owt_train_dl = DataLoader(owt_train_ds, batch_size=args.batch_size)
-owt_val_dl = DataLoader(owt_val_ds, batch_size=args.batch_size)
+# Simple data loader
+train_data = np.memmap(os.path.join(args.data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(args.data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+def get_batch(split):
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - args.block_size, (args.batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+args.block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+args.block_size]).astype(np.int64)) for i in ix])
+    if device == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    return x, y
 
 # Init iteration number and best loss. Can override later if init_from = 'resume'
 iter_num = 0
 best_val_loss = 1e9
 
-# Get vocab_size from meta file, or set to GPT2 default (50257)
+# Attempt to derive vocab_size from the dataset
 meta_path = os.path.join(args.data_dir, 'meta.pkl')
+meta_vocab_size = None
+
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
-    vocab_size = meta['vocab_size']
-    print(f"vocab_size = {vocab_size} (from {meta_path})")
-else:
-    print(f"vocab_size not found in {meta_path}, using GPT-2 default of 50257")
-    vocab_size = 50257
+    meta_vocab_size = meta['vocab_size']
+    print(f"vocab_size = {meta_vocab_size} (from {meta_path})")
 
 # Model init
 model_args = dict(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
                   block_size=args.block_size, dropout=args.dropout, 
-                  vocab_size=vocab_size, bias=args.bias)
+                  vocab_size=None, bias=args.bias)
 if args.init_from == 'scratch': # New model from scratch
     print('Initializing a new model from scratch')
+    # Determine vocab size
+    if meta_vocab_size is None:
+        print('Defaulting to vocab_size of 50304 (50257 rounded up for efficiency)')
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif args.init_from == 'resume':
@@ -135,8 +143,8 @@ elif args.init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # Compare model args with checkpoint model args
-    for k, v in model_args.items():
-        assert checkpoint_model_args[k] == v, f'checkpoint model arg: {k} do not match model arg: {k}'
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
@@ -150,26 +158,23 @@ elif args.init_from == 'resume':
     best_val_loss = checkpoint['best_val_loss']
 elif args.init_from.startswith('gpt2'):
     print(f'Initializing from OpenAI GPT2 weights: {args.init_from}')
-    assert args.bias, 'GPT2 models have bias, set bias=True'
     override_args = dict(dropout=args.dropout)
     model = GPT.from_pretrained(args.init_from, override_args)
-    model_args['n_layer'] = model.config.n_layer
-    model_args['n_head'] = model.config.n_head
-    model_args['n_embd'] = model.config.n_embd
+    # Read off the created config params, so we can store them into checkpoint correctly
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = getattr(model.config, k)
 # Crop block size
 if args.block_size < model.config.block_size:
     model.crop_block_size(args.block_size)
+    model_args['block_size'] = args.block_size
 model.to(device)
 
 # Init GradScaler if data type is float16
-scaler = None
-if args.dtype == 'float16':
-    print(f'Initializing Gradient Scaler to account for dtype: {args.dtype}')
-    scaler = torch.cuda.amp.GradScaler()
+scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
 
 # Optimizer
 optimizer = model.configure_optimizers(
-    args.weight_decay, args.learning_rate, (args.beta1, args.beta2)
+    args.weight_decay, args.learning_rate, (args.beta1, args.beta2), device_type
 )
 if args.init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -189,35 +194,27 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    # Calculate mean training loss
-    train_losses = torch.zeros(args.eval_iters)
-    for k in range(args.eval_iters):
-        X, Y = next(iter(owt_train_dl))
-        with ctx:
-            logits, loss = model(X, Y)
-        train_losses[k] = loss.item()
-    out['train'] = train_losses.mean()
-    # Calculate mean validation loss
-    val_losses = torch.zeros(args.eval_iters)
-    for k in range(args.eval_iters):
-        X, Y = next(iter(owt_val_dl))
-        with ctx:
-            logits, loss = model(X, Y)
-        val_losses[k] = loss.item()
-    out['val'] = val_losses.mean()
+    for split in ['train', 'val']:
+        losses = torch.zeros(args.eval_iters)
+        for k in range(args.eval_iters):
+            X, Y = get_batch(split)
+            with ctx:
+                logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
     model.train()
     return out
 
 # Define a learning rate scheduler (cosine with warmup)
-def get_lr(iter):
+def get_lr(it):
     # During warmup iterations: linear
-    if iter < args.warmup_iters:
-        return args.learning_rate * iter / args.warmup_iters
+    if it < args.warmup_iters:
+        return args.learning_rate * it / args.warmup_iters
     # After decay iterations: minimum
-    if iter > args.lr_decay_iters:
+    if it > args.lr_decay_iters:
         return args.min_lr
     # Decay iterations
-    decay_ratio = (iter - args.warmup_iters) / (args.lr_decay_iters - args.warmup_iters)
+    decay_ratio = (it - args.warmup_iters) / (args.lr_decay_iters - args.warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return args.min_lr + coeff * (args.learning_rate - args.min_lr)
@@ -232,16 +229,14 @@ if args.wandb_log and master_process:
     )
 
 # Training loop
+X, Y = get_batch('train') # Get first batch
 t0 = time.time()
 while True:
 
     # Get learning rate
-    if args.decay_lr:
-        lr = get_lr(iter_num)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-    else:
-        lr = args.learning_rate
+    lr = get_lr(iter_num) if args.decay_lr else args.learning_rate
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
     # If reached eval iteration, evaluate loss on train/val and write checkpoints
     if iter_num % args.eval_interval == 0 and master_process:
@@ -278,7 +273,6 @@ while True:
     # larger batch size and GradScaler if using float16
     for micro_step in range(args.gradient_accumulation_steps):
 
-        X, Y = next(iter(owt_train_dl))
         # Only sync gradients on last micro step
         if ddp: 
             model.require_backward_grad_sync = (micro_step == args.gradient_accumulation_steps - 1)
@@ -286,19 +280,19 @@ while True:
         with ctx:
             logits, loss = model(X, Y)
 
-        scaler.scale(loss).backward() if scaler else loss.backward()
+        # Async prefetch next batch while model is doing forward pass
+        X, Y = get_batch('train')
+
+        scaler.scale(loss).backward()
     
     # Clip gradient
     if args.grad_clip != 0.0:
-        scaler.unscale_(optimizer) if scaler else None
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
     # Step the optimizer
-    if scaler:
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
+    scaler.step(optimizer)
+    scaler.update()
 
     # Flush gradients
     optimizer.zero_grad(set_to_none=True)
@@ -309,7 +303,7 @@ while True:
     if iter_num % args.log_interval == 0 and master_process:
         lossf = loss.item()
         print(f'iter {iter_num}: loss {lossf:.4f}, time{dt*1000:.2f}ms')
-    iter_num +=1
+    iter_num += 1
 
     # Termination conditions
     if iter_num > args.max_iters:

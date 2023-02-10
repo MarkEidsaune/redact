@@ -1,9 +1,9 @@
-'''
-GPT2 model pretraining on openwebtext dataset.
-References:
-Andrej Karpathy's nanoGPT repository: 
-https://github.com/karpathy/nanoGPT/blob/master/train.py
-'''
+# '''
+# GPT2 model pretraining on openwebtext dataset.
+# References:
+# Andrej Karpathy's nanoGPT repository: 
+# https://github.com/karpathy/nanoGPT/blob/master/train.py
+# '''
 
 import argparse
 import os
@@ -21,6 +21,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from gpt2_model import GPTConfig, GPT
 from data.custom_datasets.owt_dataset import OWTDataset
 from torch.utils.data import DataLoader
+
+import gc # System memory leak, not sure why
 
 dttm = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -78,6 +80,7 @@ if ddp:
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # This process will do logging, checkpointing etc.
     seed_offset = ddp_rank # Each process gets a different seed
 else:
@@ -199,7 +202,7 @@ def estimate_loss():
         for k in range(args.eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -231,6 +234,7 @@ if args.wandb_log and master_process:
 # Training loop
 X, Y = get_batch('train') # Get first batch
 t0 = time.time()
+
 while True:
 
     # Get learning rate
@@ -266,6 +270,7 @@ while True:
                 }
                 print(f'Saving checkpoint to {args.out_dir}')
                 torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
+
     if iter_num == 0 and args.eval_only:
         break
 
@@ -278,7 +283,7 @@ while True:
             model.require_backward_grad_sync = (micro_step == args.gradient_accumulation_steps - 1)
         
         with ctx:
-            logits, loss = model(X, Y)
+            _, loss = model(X, Y)
 
         # Async prefetch next batch while model is doing forward pass
         X, Y = get_batch('train')
@@ -300,9 +305,11 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+
     if iter_num % args.log_interval == 0 and master_process:
         lossf = loss.item()
         print(f'iter {iter_num}: loss {lossf:.4f}, time{dt*1000:.2f}ms')
+
     iter_num += 1
 
     # Termination conditions

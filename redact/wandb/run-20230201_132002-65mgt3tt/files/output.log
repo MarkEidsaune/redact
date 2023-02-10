@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "gpt2_pretrain_openweb.py", line 247, in <module>
-    if iter_num % args.eval_iteration == 0 and master_process:
-AttributeError: 'Namespace' object has no attribute 'eval_iteration'
-Traceback (most recent call last):
-  File "gpt2_pretrain_openweb.py", line 247, in <module>
-    if iter_num % args.eval_iteration == 0 and master_process:
-AttributeError: 'Namespace' object has no attribute 'eval_iteration'

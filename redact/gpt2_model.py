@@ -115,6 +115,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
+    out_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -136,13 +137,22 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
+        if config.out_size == config.vocab_size:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            # with weight tying when using torch.compile() some warnings get generated:
+            # "UserWarning: functional_call was passed multiple values for tied weights.
+            # This behavior is deprecated and will be an error in future versions"
+            # not 100% sure what this is, so far seems to be harmless. TODO investigate
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        else:
+            self.lm_head = nn.Sequential(
+                nn.Linear(config.n_embd, config.vocab_size, bias=False),
+                nn.Linear(config.vocab_size, config.vocab_size//32, bias=False),
+                nn.Linear(config.vocab_size//32, config.vocab_size//64, bias=False),
+                nn.Linear(config.vocab_size//64, config.out_size, bias=False)
+        )
+        # Make sure original head weights are still tied to token embedding weights
+        self.transformer.wte.weight = self.lm_head[0].weight
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -200,6 +210,47 @@ class GPT(nn.Module):
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+
+    def replace_head(self, n_labels):
+        '''
+        For other tasks, such as NER, we need to replace the linear head
+        with one that outputs the correct number of labels.  To do this, 
+        we'll add three additional linear layers that ultimately reduce our
+        output to the correct dimensionality.
+        '''
+        # Replace head
+        self.lm_head = nn.Sequential(
+            self.lm_head,
+            nn.Linear(self.lm_head.out_features, self.lm_head.out_features//32, bias=False),
+            nn.Linear(self.lm_head.out_features//32, self.lm_head.out_features//64, bias=False),
+            nn.Linear(self.lm_head.out_features//64, n_labels, bias=False)
+        )
+        # Init weights
+        for i in range(1, 4):
+            torch.nn.init.normal_(self.lm_head[i].weight, mean=0.0, std=0.02)
+        # Make sure original head weights are still tied to token embedding weights
+        self.transformer.wte.weight = self.lm_head[0].weight
+
+    def freeze_layers(self):
+        '''
+        When finetuning a pretrained model it is often useful to turn off
+        the gradients of the pretrained layers and train only the newly 
+        added parameters.
+        '''
+        # Freeze transformer parameters
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+        # Freeze first layer (pretrained) of head
+        for param in self.lm_head[0].parameters():
+            param.requires_grad = False
+
+    def unfreeze_layers(self):
+        '''
+        Reverse of freeze_layers()
+        '''
+        # Unfreeze all parameters
+        for param in self.parameters():
+            param.requires_grad = True
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -294,7 +345,10 @@ class GPT(nn.Module):
         # will only return the first occurence, key'd by 'transformer.wte.weight', below.
         # so let's manually remove 'lm_head.weight' from decay set. This will include
         # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove('lm_head.weight')
+        if len(self.lm_head) > 1:
+            decay.remove('lm_head.0.weight')
+        else:
+            decay.remove('lm_head.weight')
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}

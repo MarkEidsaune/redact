@@ -24,7 +24,9 @@ dttm = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 parser = argparse.ArgumentParser(description=__doc__)
 # I/O
-parser.add_argument('--out-dir', default='/media/nvme2/models/redact', type=str, help='Output directory for saving checkpoints.')
+parser.add_argument('--model-dir', default='/media/nvme2/models/redact', type=str, help='Output directory for saving checkpoints.')
+parser.add_argument('--model-in-fname', default='ckpt.pt', type=str, help='Input (pretrained) model name.')
+parser.add_argument('--model-out-fname', default='ckpt.pt', type=str, help='Output (finetuned) model name.')
 parser.add_argument('--eval-interval', default=2000, type=int, help='Number of iterations between evaluations.')
 parser.add_argument('--log-interval', default=100, type=int, help='Number of iterations between log entries.')
 parser.add_argument('--eval-iters', default=200, type=int, help='Number of iterations to perform for each evaluation.')
@@ -86,7 +88,7 @@ else:
     seed_offset = 0
 
 if master_process:
-    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
 
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # Allow tf32 on matmul
@@ -114,35 +116,25 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
-# Attempt to derive vocab_size from the dataset
-meta_path = os.path.join(args.data_dir, 'meta.pkl')
-meta_vocab_size = None
-
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"vocab_size = {meta_vocab_size} (from {meta_path})")
-
 # Model init
 model_args = dict(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
                   block_size=args.block_size, dropout=args.dropout, 
-                  vocab_size=None, bias=args.bias)
+                  vocab_size=None, out_size=None, bias=args.bias)
 if args.init_from == 'scratch': # New model from scratch
     print('Initializing a new model from scratch')
     # Determine vocab size
-    if meta_vocab_size is None:
-        print('Defaulting to vocab_size of 50304 (50257 rounded up for efficiency)')
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    print('Defaulting to vocab_size of 50304 (50257 rounded up for efficiency)')
+    model_args['vocab_size'] = 50304
+    model_args['out_size'] = 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif args.init_from == 'resume':
-    print(f'Resuming training from {args.out_dir}')
-    ckpt_path = os.path.join(args.out_dir, 'ckpt.pt')
+    print(f'Resuming training from {args.model_dir}')
+    ckpt_path = os.path.join(args.model_dir, args.model_in_fname)
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # Compare model args with checkpoint model args
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'out_size']:
         model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -155,13 +147,6 @@ elif args.init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-elif args.init_from.startswith('gpt2'):
-    print(f'Initializing from OpenAI GPT2 weights: {args.init_from}')
-    override_args = dict(dropout=args.dropout)
-    model = GPT.from_pretrained(args.init_from, override_args)
-    # Read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
 # Crop block size
 if args.block_size < model.config.block_size:
     model.crop_block_size(args.block_size)
@@ -264,8 +249,8 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config
                 }
-                print(f'Saving checkpoint to {args.out_dir}')
-                torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
+                print(f'Saving checkpoint to {args.model_dir}')
+                torch.save(checkpoint, os.path.join(args.model_dir, args.model_out_fname))
 
     if iter_num == 0 and args.eval_only:
         break

@@ -13,6 +13,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -22,14 +23,13 @@ dttm = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 parser = argparse.ArgumentParser(description=__doc__)
 # I/O
-parser.add_argument('--out-dir', default='/media/nvme2/models/redact', type=str, help='Output directory for saving checkpoints.')
-parser.add_argument('--model-fname', default='ckpt_owt.pt', type=str, help='Filename of model checkpoint.')
-parser.add_argument('--labels-dir', default='data/n2c2/label2id.json', type=str, help='Path to n2c2 labels to label ids map')
+parser.add_argument('--model-dir', default='/media/nvme2/models/redact', type=str, help='Output directory for saving checkpoints.')
+parser.add_argument('--model-in-fname', default='ckpt.pt', type=str, help='Input (pretrained) model name.')
+parser.add_argument('--model-out-fname', default='ckpt_n2c2.pt', type=str, help='Output (finetuned) model name.')
+parser.add_argument('--labels-path', default='data/n2c2/label2id.json', type=str, help='Path to n2c2 labels to label ids map')
 parser.add_argument('--eval-interval', default=1000, type=int, help='Number of iterations between evaluations.')
 parser.add_argument('--log-interval', default=100, type=int, help='Number of iterations between log entries.')
 parser.add_argument('--eval-iters', default=200, type=int, help='Number of iterations to perform for each evaluation.')
-parser.add_argument('--eval-only', action='store_true', help='Default = false. If true, script exits after the first evaluation.')
-parser.add_argument('--always-save-checkpoint', action='store_true', help='Default = false. If true, save checkpoint after each evaluation.  Otherwise, save only after beating best validation loss.')
 # Logging
 parser.add_argument( '--wandb-log', action='store_true', help='Default = false.  If true, log results using wandb account.')
 parser.add_argument('--wandb-project', default='gpt2_finetuning_n2c2', type=str, help='Wandb project name.')
@@ -37,8 +37,8 @@ parser.add_argument('--wandb-run-name', default=dttm, type=str, help='Wandb run 
 # Data
 parser.add_argument('--dataset', default='n2c2', type=str, help='Name of training dataset.')
 parser.add_argument('--data-dir', default='/media/nvme2/n2c2', type=str, help='Data directory for training dataset.')
-parser.add_argument('--gradient-accumulation-steps', default=4, type=int, help='Used to simulate larger batch sizes.')
-parser.add_argument('--batch-size', default=3, type=int, help='Batch size.  If gradient-accumulation-steps > 1, this is the micro-batch size.')
+parser.add_argument('--gradient-accumulation-steps', default=6, type=int, help='Used to simulate larger batch sizes.')
+parser.add_argument('--batch-size', default=2, type=int, help='Batch size.  If gradient-accumulation-steps > 1, this is the micro-batch size.')
 parser.add_argument('--block-size', default=1024, type=int, help='Number of input tokens.')
 # Model
 parser.add_argument('--n-layer', default=12, type=int, help='Number of transformer blocks in model.')
@@ -46,17 +46,16 @@ parser.add_argument('--n-head', default=12, type=int, help='Number of attention 
 parser.add_argument('--n-embd', default=768, type=int, help='Length of embedding vectors (token & position).')
 parser.add_argument('--dropout', default=0.0, type=float, help='For pretraining, 0 is good, for finetuning try 0.1+.')
 parser.add_argument('--bias', action='store_true', help='Default = false.  If true, use bias in LayerNorm and Linear layers.')
-parser.add_argument('--freeze', action='store_true', help='Default = false.  If true, freeze all parameters except those of the last 3 linear layers of the head.')
-parser.add_argument('--replace-head', action='store_true', help='Default = false.  If true, replace head with original head + 3 new linear layers that reduce output dimensionality to n_labels.')
 # Optimizer
 parser.add_argument('--learning-rate', default=6e-5, type=float, help='Maximum learning rate.')
 parser.add_argument('--max-iters', default=100000, type=int, help='Total number of training iterations.')
+parser.add_argument('--freeze', action='store_true', help='Default = false.  If true, freeze all parameters except final three head layers.')
 parser.add_argument('--weight-decay', default=1e-2, type=float)
 parser.add_argument('--beta1', default=0.9, type=float)
 parser.add_argument('--beta2', default=0.95, type=float)
 parser.add_argument('--grad-clip', default=1.0, type=float, help='Clip gradients at this value, or disable if = 0.0.')
 # Learning rate decay
-parser.add_argument('--decay-lr', action='store_false', help='Default = true. If false, do not decay learning rate.')
+parser.add_argument('--decay-lr', action='store_true', help='Default = false. If true, decay learning rate.')
 parser.add_argument('--warmup-iters', default=1000, type=int)
 parser.add_argument('--lr-decay-iters', default=100000, type=int, help='Should be ~ max-iters.')
 parser.add_argument('--min-lr', default=6e-6, type=float, help='Should be ~ learning_rate/10.')
@@ -87,7 +86,7 @@ else:
     seed_offset = 0
 
 if master_process:
-    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
 
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # Allow tf32 on matmul
@@ -116,22 +115,23 @@ iter_num = 0
 best_val_loss = 1e9
 
 # Get number of labels
-with open(args.labels_dir, 'r') as f:
+with open(args.labels_path, 'r') as f:
     label2id = json.load(f)
 n_labels = max(label2id.values())
 
-# Model init
-model_args = dict(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
-                  block_size=args.block_size, dropout=args.dropout, 
-                  vocab_size=None, bias=args.bias)
-ckpt_path = os.path.join(args.out_dir, args.model_fname)
+# Get input model checkpoint
+print(f'Loading model checkpoint: {args.model_in_fname}')
+ckpt_path = os.path.join(args.model_dir, args.model_in_fname)
 checkpoint = torch.load(ckpt_path, map_location=device)
-checkpoint_model_args = checkpoint['model_args']
-# Compare model args with checkpoint model args
-for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-    model_args[k] = checkpoint_model_args[k]
+model_args = checkpoint['model_args']
+
+# Model init
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
+# If checkpoint was trained on NER task, replace model head prior to loading state dict
+if model_args['out_size'] == n_labels:
+    print(f'Replacing model head prior to loading state dict')
+    model.replace_head(n_labels)
 state_dict = checkpoint['model']
 # Fix state dict keys, remove '_orig_mod.'
 unwanted_prefix = '_orig_mod.'
@@ -139,18 +139,25 @@ for k, v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 model.load_state_dict(state_dict)
-# Replace head
-if args.replace_head:
-    print('Replacing model head')
+# If checkpoint was trained on next word prediction, replace model head after loading state dict
+if model_args['out_size'] > n_labels:
+    print(f'Replacing model head after loading state dict')
     model.replace_head(n_labels)
+    model_args['out_size'] = n_labels
+
 # Crop block size
 if args.block_size < model.config.block_size:
     model.crop_block_size(args.block_size)
     model_args['block_size'] = args.block_size
-# Freeze all parameters except new layers of head
+
 if args.freeze:
+    # Freeze all parameters except new layers of head
     print('Freezing pretrained layers')
-    model.freeze_layers()
+    for param in model.transformer.parameters():
+        param.requires_grad = False
+    # Freeze first (pretrained) layer of head
+    for param in model.lm_head[0].parameters():
+        param.requires_grad = False
 
 model.to(device)
 
@@ -211,7 +218,7 @@ if args.wandb_log and master_process:
         config=config
     )
 
-# Training loop
+# Frozen iterations training loop
 X, Y = get_batch('train') # Get first batch
 t0 = time.time()
 
@@ -236,7 +243,8 @@ while True:
                 'lr': lr
             })
         # If new best validation loss, save checkpoint
-        if losses['val'] < best_val_loss or args.always_save_checkpoint:
+        # For some reason, sometimes the loss is negative, need to look into this
+        if (losses['val'] < best_val_loss) & (losses['val'] > 0):
             best_val_loss = losses['val']
             raw_model = model.module if ddp else model
             if iter_num > 0:
@@ -248,11 +256,8 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config
                 }
-                print(f'Saving checkpoint to {args.out_dir}')
-                torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt_n2c2_frozen.pt'))
-
-    if iter_num == 0 and args.eval_only:
-        break
+                print(f'Saving checkpoint to {args.model_dir}')
+                torch.save(checkpoint, os.path.join(args.model_dir, args.model_out_fname))
 
     # Forward and backward pass with optional gradient accumulation to simulate 
     # larger batch size and GradScaler if using float16

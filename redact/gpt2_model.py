@@ -137,29 +137,19 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        if config.out_size == config.vocab_size:
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-            # with weight tying when using torch.compile() some warnings get generated:
-            # "UserWarning: functional_call was passed multiple values for tied weights.
-            # This behavior is deprecated and will be an error in future versions"
-            # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        else:
-            self.lm_head = nn.Sequential(
-                nn.Linear(config.n_embd, config.vocab_size, bias=False),
-                nn.Linear(config.vocab_size, config.vocab_size//32, bias=False),
-                nn.Linear(config.vocab_size//32, config.vocab_size//64, bias=False),
-                nn.Linear(config.vocab_size//64, config.out_size, bias=False)
-        )
-        # Make sure original head weights are still tied to token embedding weights
-        self.transformer.wte.weight = self.lm_head[0].weight
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # with weight tying when using torch.compile() some warnings get generated:
+        # "UserWarning: functional_call was passed multiple values for tied weights.
+        # This behavior is deprecated and will be an error in future versions"
+        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
         # report number of parameters
         n_params = sum(p.numel() for p in self.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
@@ -210,105 +200,22 @@ class GPT(nn.Module):
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-
-    def replace_head(self, n_labels):
-        '''
-        For other tasks, such as NER, we need to replace the linear head
-        with one that outputs the correct number of labels.  To do this, 
-        we'll add three additional linear layers that ultimately reduce our
-        output to the correct dimensionality.
-        '''
-        # Replace head
+    
+    def replace_head(self, out_size):
+        # Model surgery to reduce model output from vocab_size to output_size
         self.lm_head = nn.Sequential(
-            self.lm_head,
-            nn.Linear(self.lm_head.out_features, self.lm_head.out_features//32, bias=False),
-            nn.Linear(self.lm_head.out_features//32, self.lm_head.out_features//64, bias=False),
-            nn.Linear(self.lm_head.out_features//64, n_labels, bias=False)
-        )
+                self.lm_head,
+                nn.Linear(self.config.vocab_size, self.config.vocab_size//32, bias=False),
+                nn.Linear(self.config.vocab_size//32, self.config.vocab_size//64, bias=False),
+                nn.Linear(self.config.vocab_size//64, out_size, bias=False)
+            )
         # Init weights
         for i in range(1, 4):
             torch.nn.init.normal_(self.lm_head[i].weight, mean=0.0, std=0.02)
-        # Make sure original head weights are still tied to token embedding weights
+        # Tie first layer weights of new head to token embedding weights
         self.transformer.wte.weight = self.lm_head[0].weight
-
-    def freeze_layers(self):
-        '''
-        When finetuning a pretrained model it is often useful to turn off
-        the gradients of the pretrained layers and train only the newly 
-        added parameters.
-        '''
-        # Freeze transformer parameters
-        for param in self.transformer.parameters():
-            param.requires_grad = False
-        # Freeze first layer (pretrained) of head
-        for param in self.lm_head[0].parameters():
-            param.requires_grad = False
-
-    def unfreeze_layers(self):
-        '''
-        Reverse of freeze_layers()
-        '''
-        # Unfreeze all parameters
-        for param in self.parameters():
-            param.requires_grad = True
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        print('Forcing vocab_size=50257, block_size=1024, bias=True')
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
-        config_args['bias'] = True
-        # we can override the dropout rate
-        if 'dropout' in override_args:
-            print(f"Overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # block_size is always 1024 for GPT model checkpoints
-        # if one wants a lower block_size it has to be done through model surgery
-        # later, by calling crop_block_size()
-
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
-        for k in keys:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
+        # Update config
+        self.config.out_size = out_size
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
